@@ -1,6 +1,6 @@
 /**
  * RemoCam Mobile App
- * Clean rewrite - no module-level side effects
+ * Full rewrite with Home/Share/View modes, persistent room code, proper UI
  */
 
 import React, { useEffect, useState, useRef, useCallback } from 'react';
@@ -10,24 +10,29 @@ import {
   Text,
   View,
   TouchableOpacity,
+  TextInput,
   Alert,
   Platform,
   PermissionsAndroid,
   StatusBar,
+  KeyboardAvoidingView,
+  ScrollView,
 } from 'react-native';
 
 const BACKEND_URL = 'https://camera-i73y.onrender.com';
+const ROOM_CODE_KEY = 'remocam_room_code';
 
+// Lazy load native modules - prevents crash on startup
 let RTCPeerConnection: any = null;
 let RTCIceCandidate: any = null;
 let RTCSessionDescription: any = null;
 let mediaDevices: any = null;
 let RTCView: any = null;
 let io: any = null;
+let AsyncStorage: any = null;
 let ReactNativeForegroundService: any = null;
 
-// Lazy load all native modules to prevent crash on startup
-function loadNativeModules() {
+function loadModules(): boolean {
   try {
     const webrtc = require('react-native-webrtc');
     RTCPeerConnection = webrtc.RTCPeerConnection;
@@ -35,24 +40,21 @@ function loadNativeModules() {
     RTCSessionDescription = webrtc.RTCSessionDescription;
     mediaDevices = webrtc.mediaDevices;
     RTCView = webrtc.RTCView;
-  } catch (e) {
-    console.error('WebRTC load failed:', e);
-    return false;
-  }
+  } catch (e) { console.error('WebRTC failed:', e); return false; }
+
   try {
     io = require('socket.io-client').io;
-  } catch (e) {
-    console.error('Socket.io load failed:', e);
-    return false;
-  }
+  } catch (e) { console.error('Socket.io failed:', e); return false; }
+
+  try {
+    AsyncStorage = require('@react-native-async-storage/async-storage').default;
+  } catch (e) { console.warn('AsyncStorage failed (non-fatal):', e); }
+
   try {
     ReactNativeForegroundService = require('@supersami/rn-foreground-service').default;
     ReactNativeForegroundService.register();
-  } catch (e) {
-    // foreground service optional - app can work without it
-    console.warn('ForegroundService load failed (non-fatal):', e);
-    ReactNativeForegroundService = null;
-  }
+  } catch (e) { console.warn('ForegroundService failed (non-fatal):', e); ReactNativeForegroundService = null; }
+
   return true;
 }
 
@@ -61,119 +63,100 @@ const ICE_SERVERS = {
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
     { urls: 'stun:openrelay.metered.ca:80' },
-    {
-      urls: 'turn:openrelay.metered.ca:80',
-      username: 'openrelayproject',
-      credential: 'openrelayproject',
-    },
+    { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+    { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
   ],
 };
 
+type Screen = 'home' | 'share' | 'view';
+
 export default function App() {
   const [ready, setReady] = useState(false);
-  const [initError, setInitError] = useState('');
+  const [screen, setScreen] = useState<Screen>('home');
   const [roomCode, setRoomCode] = useState('');
+  const [viewerCode, setViewerCode] = useState('');
   const [isSharing, setIsSharing] = useState(false);
-  const [status, setStatus] = useState('Press "Start Sharing" to begin');
+  const [isConnecting, setIsConnecting] = useState(false);
+  const [status, setStatus] = useState('');
   const [localStream, setLocalStream] = useState<any>(null);
+  const [remoteStream, setRemoteStream] = useState<any>(null);
 
   const socketRef = useRef<any>(null);
-  const peerConnectionRef = useRef<any>(null);
+  const pcRef = useRef<any>(null);
   const streamRef = useRef<any>(null);
 
+  // --- Init ---
   useEffect(() => {
-    // Initialize everything inside useEffect - never at module level
     try {
-      const ok = loadNativeModules();
-      if (!ok) {
-        setInitError('Failed to load camera modules. Please restart the app.');
-        return;
-      }
-      // Generate room code
-      const code = Math.floor(100000 + Math.random() * 900000).toString();
-      setRoomCode(code);
+      const ok = loadModules();
+      if (!ok) { setStatus('init_error'); return; }
+      loadOrCreateRoomCode();
       setReady(true);
     } catch (e: any) {
-      setInitError(`Initialization error: ${e?.message || 'Unknown error'}`);
+      setStatus('init_error');
     }
-
-    return () => {
-      cleanup();
-    };
   }, []);
 
+  const loadOrCreateRoomCode = async () => {
+    try {
+      let code = null;
+      if (AsyncStorage) {
+        code = await AsyncStorage.getItem(ROOM_CODE_KEY);
+      }
+      if (!code) {
+        code = Math.floor(100000 + Math.random() * 900000).toString();
+        if (AsyncStorage) await AsyncStorage.setItem(ROOM_CODE_KEY, code);
+      }
+      setRoomCode(code);
+    } catch {
+      const code = Math.floor(100000 + Math.random() * 900000).toString();
+      setRoomCode(code);
+    }
+  };
+
+  // --- Cleanup ---
   const cleanup = useCallback(() => {
     try {
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach((t: any) => t.stop());
-        streamRef.current = null;
-      }
-      if (peerConnectionRef.current) {
-        peerConnectionRef.current.close();
-        peerConnectionRef.current = null;
-      }
-      if (socketRef.current) {
-        socketRef.current.disconnect();
-        socketRef.current = null;
-      }
+      streamRef.current?.getTracks().forEach((t: any) => t.stop());
+      streamRef.current = null;
+      pcRef.current?.close();
+      pcRef.current = null;
+      socketRef.current?.disconnect();
+      socketRef.current = null;
+      setLocalStream(null);
+      setRemoteStream(null);
+      setIsSharing(false);
+      setIsConnecting(false);
       if (ReactNativeForegroundService) {
         try { ReactNativeForegroundService.stop(); } catch (_) {}
       }
-    } catch (e) {
-      console.warn('Cleanup error:', e);
-    }
+    } catch (e) { console.warn('cleanup error', e); }
   }, []);
 
+  // --- Permissions ---
   const requestPermissions = useCallback(async (): Promise<boolean> => {
     if (Platform.OS !== 'android') return true;
     try {
-      const grants = await PermissionsAndroid.requestMultiple([
+      const perms: string[] = [
         PermissionsAndroid.PERMISSIONS.CAMERA,
         PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
-        ...(Platform.Version >= 33 ? [PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS] : []),
-      ]);
-      const cameraOk = grants[PermissionsAndroid.PERMISSIONS.CAMERA] === PermissionsAndroid.RESULTS.GRANTED;
-      const micOk = grants[PermissionsAndroid.PERMISSIONS.RECORD_AUDIO] === PermissionsAndroid.RESULTS.GRANTED;
-      if (!cameraOk || !micOk) {
-        Alert.alert('Permission Denied', 'Camera and Microphone permissions are required.');
-        return false;
-      }
-      return true;
-    } catch (e) {
-      console.warn('Permission error:', e);
-      return false;
-    }
+      ];
+      if (Platform.Version >= 33) perms.push(PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS);
+      const grants = await PermissionsAndroid.requestMultiple(perms);
+      return (
+        grants[PermissionsAndroid.PERMISSIONS.CAMERA] === PermissionsAndroid.RESULTS.GRANTED &&
+        grants[PermissionsAndroid.PERMISSIONS.RECORD_AUDIO] === PermissionsAndroid.RESULTS.GRANTED
+      );
+    } catch { return false; }
   }, []);
 
-  const startForegroundService = useCallback(() => {
-    if (!ReactNativeForegroundService) return;
-    try {
-      ReactNativeForegroundService.start({
-        id: 3456,
-        title: 'RemoCam is Active',
-        message: 'Camera is sharing in the background',
-        icon: 'ic_launcher',
-        setOnlyAlertOnce: true,
-        color: '#3b82f6',
-      });
-    } catch (e) {
-      console.warn('ForegroundService start error (non-fatal):', e);
-    }
-  }, []);
-
+  // ===================== SHARE MODE =====================
   const startSharing = useCallback(async () => {
-    if (!ready) return;
-
-    setStatus('Requesting permissions...');
-    const hasPerms = await requestPermissions();
-    if (!hasPerms) {
-      setStatus('Permissions denied');
-      return;
-    }
+    const ok = await requestPermissions();
+    if (!ok) { Alert.alert('Permission Denied', 'Camera & Mic permissions are required.'); return; }
 
     setStatus('Starting camera...');
     try {
-      // Camera stream
       const stream = await mediaDevices.getUserMedia({
         audio: true,
         video: { facingMode: 'environment', width: 640, height: 480 },
@@ -181,107 +164,156 @@ export default function App() {
       streamRef.current = stream;
       setLocalStream(stream);
 
-      // Start foreground service for background support
-      startForegroundService();
+      // Foreground service
+      if (ReactNativeForegroundService) {
+        try {
+          ReactNativeForegroundService.start({
+            id: 3456, title: 'RemoCam Active',
+            message: 'Camera is sharing in background',
+            icon: 'ic_launcher', setOnlyAlertOnce: true, color: '#3b82f6',
+          });
+        } catch (_) {}
+      }
 
-      // Connect socket
       setStatus('Connecting to server...');
-      const socket = io(BACKEND_URL, {
-        transports: ['websocket'],
-        timeout: 10000,
-      });
+      const socket = io(BACKEND_URL, { transports: ['websocket'], timeout: 10000 });
       socketRef.current = socket;
 
       socket.on('connect', () => {
         socket.emit('register-camera', roomCode);
         setIsSharing(true);
-        setStatus('✓ Connected. Waiting for viewer...\nCode: ' + roomCode);
+        setStatus('✓ Sharing active. Waiting for viewer...');
       });
 
-      socket.on('connect_error', (err: any) => {
-        setStatus('Server connection failed: ' + err.message);
-      });
+      socket.on('connect_error', (e: any) => setStatus('Server error: ' + e.message));
 
       socket.on('viewer-joined', () => {
-        setStatus('Viewer connected! Streaming...');
-        startWebRTC();
+        setStatus('📱 Viewer connected! Streaming...');
+        startShareWebRTC();
       });
 
       socket.on('answer', (answer: any) => {
-        if (peerConnectionRef.current) {
-          peerConnectionRef.current.setRemoteDescription(
-            new RTCSessionDescription(answer)
-          ).catch(console.error);
-        }
+        pcRef.current?.setRemoteDescription(new RTCSessionDescription(answer)).catch(console.error);
       });
 
-      socket.on('ice-candidate', (candidate: any) => {
-        if (peerConnectionRef.current && candidate) {
-          peerConnectionRef.current.addIceCandidate(
-            new RTCIceCandidate(candidate)
-          ).catch(console.error);
-        }
+      socket.on('ice-candidate', (c: any) => {
+        if (c) pcRef.current?.addIceCandidate(new RTCIceCandidate(c)).catch(console.error);
       });
-
     } catch (e: any) {
-      console.error('Start sharing error:', e);
-      setStatus('Error: ' + (e?.message || 'Failed to start camera'));
-      Alert.alert('Camera Error', e?.message || 'Failed to access camera. Check permissions.');
+      setStatus('Error: ' + e?.message);
+      Alert.alert('Camera Error', e?.message || 'Failed to access camera.');
     }
-  }, [ready, roomCode, requestPermissions, startForegroundService]);
+  }, [roomCode, requestPermissions]);
 
-  const startWebRTC = useCallback(async () => {
+  const startShareWebRTC = useCallback(async () => {
     try {
       const pc = new RTCPeerConnection(ICE_SERVERS);
-      peerConnectionRef.current = pc;
-
-      pc.onicecandidate = (event: any) => {
-        if (event.candidate && socketRef.current) {
-          socketRef.current.emit('ice-candidate', {
-            roomCode,
-            candidate: event.candidate,
-          });
-        }
+      pcRef.current = pc;
+      pc.onicecandidate = (e: any) => {
+        if (e.candidate) socketRef.current?.emit('ice-candidate', { roomCode, candidate: e.candidate });
       };
-
-      pc.onconnectionstatechange = () => {
-        setStatus('Stream state: ' + pc.connectionState);
-      };
-
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach((track: any) => {
-          pc.addTrack(track, streamRef.current);
-        });
-      }
-
-      const offer = await pc.createOffer({ offerToReceiveVideo: false, offerToReceiveAudio: false });
+      streamRef.current?.getTracks().forEach((t: any) => pc.addTrack(t, streamRef.current));
+      const offer = await pc.createOffer({});
       await pc.setLocalDescription(offer);
       socketRef.current?.emit('offer', { roomCode, offer });
-    } catch (e: any) {
-      console.error('WebRTC error:', e);
-      setStatus('WebRTC Error: ' + e?.message);
-    }
+    } catch (e: any) { setStatus('WebRTC error: ' + e?.message); }
   }, [roomCode]);
 
   const stopSharing = useCallback(() => {
     cleanup();
-    setLocalStream(null);
-    setIsSharing(false);
-    setStatus('Stopped. Press "Start Sharing" to begin again.');
+    setStatus('');
   }, [cleanup]);
 
-  // Error screen
-  if (initError) {
+  // ===================== VIEW MODE =====================
+  const connectToCamera = useCallback(async () => {
+    const code = viewerCode.trim();
+    if (code.length !== 6) {
+      Alert.alert('Invalid Code', 'Please enter a valid 6-digit room code.');
+      return;
+    }
+    setIsConnecting(true);
+    setStatus('Connecting to camera...');
+
+    try {
+      const socket = io(BACKEND_URL, { transports: ['websocket'], timeout: 10000 });
+      socketRef.current = socket;
+
+      socket.on('connect', () => {
+        socket.emit('join-as-viewer', code);
+        setStatus('Waiting for camera stream...');
+      });
+
+      socket.on('connect_error', (e: any) => {
+        setStatus('Server error: ' + e.message);
+        setIsConnecting(false);
+      });
+
+      socket.on('offer', async (offer: any) => {
+        try {
+          const pc = new RTCPeerConnection(ICE_SERVERS);
+          pcRef.current = pc;
+
+          pc.onicecandidate = (e: any) => {
+            if (e.candidate) socket.emit('ice-candidate', { roomCode: code, candidate: e.candidate });
+          };
+
+          pc.ontrack = (e: any) => {
+            if (e.streams && e.streams[0]) {
+              setRemoteStream(e.streams[0]);
+              setStatus('🎥 Live stream connected!');
+              setIsConnecting(false);
+            }
+          };
+
+          await pc.setRemoteDescription(new RTCSessionDescription(offer));
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          socket.emit('answer', { roomCode: code, answer });
+        } catch (e: any) {
+          setStatus('Stream error: ' + e?.message);
+          setIsConnecting(false);
+        }
+      });
+
+      socket.on('ice-candidate', (c: any) => {
+        if (c) pcRef.current?.addIceCandidate(new RTCIceCandidate(c)).catch(console.error);
+      });
+
+      socket.on('camera-offline', () => {
+        setStatus('Camera is offline or code is wrong.');
+        setIsConnecting(false);
+      });
+
+    } catch (e: any) {
+      setStatus('Error: ' + e?.message);
+      setIsConnecting(false);
+    }
+  }, [viewerCode]);
+
+  const disconnectViewer = useCallback(() => {
+    cleanup();
+    setStatus('');
+  }, [cleanup]);
+
+  // ===================== NAVIGATION =====================
+  const goHome = useCallback(() => {
+    cleanup();
+    setStatus('');
+    setViewerCode('');
+    setScreen('home');
+  }, [cleanup]);
+
+  // ===================== ERROR STATE =====================
+  if (status === 'init_error') {
     return (
       <SafeAreaView style={styles.errorContainer}>
-        <Text style={styles.errorTitle}>⚠️ Startup Error</Text>
-        <Text style={styles.errorText}>{initError}</Text>
-        <Text style={styles.errorHint}>Please reinstall the app or contact support.</Text>
+        <Text style={styles.errorIcon}>⚠️</Text>
+        <Text style={styles.errorTitle}>Startup Error</Text>
+        <Text style={styles.errorText}>Failed to load camera modules. Please reinstall the app.</Text>
       </SafeAreaView>
     );
   }
 
-  // Loading screen
   if (!ready) {
     return (
       <SafeAreaView style={styles.container}>
@@ -290,78 +322,211 @@ export default function App() {
     );
   }
 
+  // ===================== HOME SCREEN =====================
+  if (screen === 'home') {
+    return (
+      <SafeAreaView style={styles.container}>
+        <StatusBar barStyle="light-content" backgroundColor="#0f172a" />
+        <View style={styles.homeContent}>
+          <View style={styles.homeLogoArea}>
+            <Text style={styles.homeLogo}>📷</Text>
+            <Text style={styles.homeTitle}>RemoCam</Text>
+            <Text style={styles.homeSubtitle}>Turn your phone into a remote camera</Text>
+          </View>
+
+          <View style={styles.homeCard}>
+            <TouchableOpacity style={styles.btnShare} onPress={() => setScreen('share')} activeOpacity={0.85}>
+              <Text style={styles.btnIcon}>📸</Text>
+              <View>
+                <Text style={styles.btnTitle}>Share Camera</Text>
+                <Text style={styles.btnDesc}>Stream this phone's camera</Text>
+              </View>
+            </TouchableOpacity>
+
+            <View style={styles.divider} />
+
+            <TouchableOpacity style={styles.btnView} onPress={() => setScreen('view')} activeOpacity={0.85}>
+              <Text style={styles.btnIcon}>👁️</Text>
+              <View>
+                <Text style={styles.btnTitleDark}>View Camera</Text>
+                <Text style={styles.btnDescDark}>Watch a remote camera stream</Text>
+              </View>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </SafeAreaView>
+    );
+  }
+
+  // ===================== SHARE SCREEN =====================
+  if (screen === 'share') {
+    return (
+      <SafeAreaView style={styles.container}>
+        <StatusBar barStyle="light-content" backgroundColor="#0f172a" />
+        <View style={styles.topBar}>
+          <TouchableOpacity onPress={goHome} style={styles.backBtn}>
+            <Text style={styles.backBtnText}>← Back</Text>
+          </TouchableOpacity>
+          <Text style={styles.screenTitle}>Share Camera</Text>
+          <View style={{ width: 70 }} />
+        </View>
+
+        <View style={styles.videoContainer}>
+          {localStream && RTCView ? (
+            <RTCView streamURL={localStream.toURL()} style={styles.video} objectFit="cover" zOrder={0} />
+          ) : (
+            <View style={styles.placeholder}>
+              <Text style={styles.placeholderIcon}>📷</Text>
+              <Text style={styles.placeholderText}>Camera Preview</Text>
+              <Text style={styles.placeholderSub}>Start sharing to activate camera</Text>
+            </View>
+          )}
+        </View>
+
+        <View style={styles.controls}>
+          <View style={styles.codeBox}>
+            <Text style={styles.codeLabel}>YOUR ROOM CODE</Text>
+            <Text style={styles.code}>{roomCode}</Text>
+            <Text style={styles.codeHint}>Share this code with the viewer</Text>
+          </View>
+          {!!status && <Text style={styles.statusText}>{status}</Text>}
+          {!isSharing ? (
+            <TouchableOpacity style={styles.btnStart} onPress={startSharing} activeOpacity={0.85}>
+              <Text style={styles.actionBtnText}>▶  Start Sharing</Text>
+            </TouchableOpacity>
+          ) : (
+            <TouchableOpacity style={styles.btnStop} onPress={stopSharing} activeOpacity={0.85}>
+              <Text style={styles.actionBtnText}>■  Stop Sharing</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+      </SafeAreaView>
+    );
+  }
+
+  // ===================== VIEW SCREEN =====================
   return (
     <SafeAreaView style={styles.container}>
       <StatusBar barStyle="light-content" backgroundColor="#0f172a" />
-
-      <View style={styles.header}>
-        <Text style={styles.title}>📷 RemoCam</Text>
-        <Text style={styles.subtitle}>Remote Camera Sharing</Text>
+      <View style={styles.topBar}>
+        <TouchableOpacity onPress={goHome} style={styles.backBtn}>
+          <Text style={styles.backBtnText}>← Back</Text>
+        </TouchableOpacity>
+        <Text style={styles.screenTitle}>View Camera</Text>
+        <View style={{ width: 70 }} />
       </View>
 
       <View style={styles.videoContainer}>
-        {localStream && RTCView ? (
-          <RTCView
-            streamURL={localStream.toURL()}
-            style={styles.video}
-            objectFit="cover"
-            zOrder={0}
-          />
+        {remoteStream && RTCView ? (
+          <RTCView streamURL={remoteStream.toURL()} style={styles.video} objectFit="cover" zOrder={0} />
         ) : (
           <View style={styles.placeholder}>
-            <Text style={styles.placeholderIcon}>📷</Text>
-            <Text style={styles.placeholderText}>Camera Preview</Text>
-            <Text style={styles.placeholderSub}>Start sharing to see preview</Text>
+            <Text style={styles.placeholderIcon}>👁️</Text>
+            <Text style={styles.placeholderText}>
+              {isConnecting ? 'Connecting...' : 'No Stream'}
+            </Text>
+            <Text style={styles.placeholderSub}>
+              {isConnecting ? 'Please wait...' : 'Enter code below to connect'}
+            </Text>
           </View>
         )}
       </View>
 
-      <View style={styles.controls}>
-        <View style={styles.codeBox}>
-          <Text style={styles.codeLabel}>Your Room Code</Text>
-          <Text style={styles.code}>{roomCode}</Text>
-          <Text style={styles.codeHint}>Enter this code in the web viewer</Text>
+      <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+        <View style={styles.controls}>
+          {!remoteStream ? (
+            <>
+              <Text style={styles.inputLabel}>ENTER ROOM CODE</Text>
+              <TextInput
+                style={styles.codeInput}
+                value={viewerCode}
+                onChangeText={setViewerCode}
+                placeholder="6-digit code"
+                placeholderTextColor="#475569"
+                keyboardType="number-pad"
+                maxLength={6}
+                editable={!isConnecting}
+              />
+              {!!status && <Text style={styles.statusText}>{status}</Text>}
+              <TouchableOpacity
+                style={[styles.btnStart, isConnecting && styles.btnDisabled]}
+                onPress={connectToCamera}
+                disabled={isConnecting}
+                activeOpacity={0.85}>
+                <Text style={styles.actionBtnText}>
+                  {isConnecting ? '⏳ Connecting...' : '▶  Connect'}
+                </Text>
+              </TouchableOpacity>
+            </>
+          ) : (
+            <>
+              {!!status && <Text style={styles.statusText}>{status}</Text>}
+              <TouchableOpacity style={styles.btnStop} onPress={disconnectViewer} activeOpacity={0.85}>
+                <Text style={styles.actionBtnText}>■  Disconnect</Text>
+              </TouchableOpacity>
+            </>
+          )}
         </View>
-
-        <Text style={styles.statusText}>{status}</Text>
-
-        {!isSharing ? (
-          <TouchableOpacity style={styles.buttonStart} onPress={startSharing} activeOpacity={0.8}>
-            <Text style={styles.buttonText}>▶ Start Sharing</Text>
-          </TouchableOpacity>
-        ) : (
-          <TouchableOpacity style={styles.buttonStop} onPress={stopSharing} activeOpacity={0.8}>
-            <Text style={styles.buttonText}>■ Stop Sharing</Text>
-          </TouchableOpacity>
-        )}
-      </View>
+      </KeyboardAvoidingView>
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#0f172a' },
+
+  // Error / loading
   errorContainer: { flex: 1, backgroundColor: '#0f172a', justifyContent: 'center', alignItems: 'center', padding: 30 },
-  errorTitle: { color: '#ef4444', fontSize: 24, fontWeight: 'bold', marginBottom: 16 },
-  errorText: { color: '#fca5a5', fontSize: 14, textAlign: 'center', marginBottom: 16 },
-  errorHint: { color: '#64748b', fontSize: 12, textAlign: 'center' },
+  errorIcon: { fontSize: 48, marginBottom: 16 },
+  errorTitle: { color: '#ef4444', fontSize: 22, fontWeight: 'bold', marginBottom: 12 },
+  errorText: { color: '#fca5a5', fontSize: 14, textAlign: 'center' },
   loadingText: { color: '#94a3b8', fontSize: 18, textAlign: 'center', marginTop: 200 },
-  header: { padding: 20, alignItems: 'center', paddingTop: 10 },
-  title: { fontSize: 28, fontWeight: 'bold', color: '#fff', letterSpacing: 1 },
-  subtitle: { color: '#64748b', marginTop: 4, fontSize: 13 },
+
+  // Home
+  homeContent: { flex: 1, justifyContent: 'center', padding: 24 },
+  homeLogoArea: { alignItems: 'center', marginBottom: 40 },
+  homeLogo: { fontSize: 64, marginBottom: 12 },
+  homeTitle: { fontSize: 36, fontWeight: 'bold', color: '#fff', letterSpacing: 1 },
+  homeSubtitle: { color: '#64748b', fontSize: 14, marginTop: 6 },
+  homeCard: { backgroundColor: '#1e293b', borderRadius: 20, overflow: 'hidden', borderWidth: 1, borderColor: '#334155' },
+  btnShare: { flexDirection: 'row', alignItems: 'center', gap: 16, padding: 22, backgroundColor: '#3b82f6' },
+  btnView: { flexDirection: 'row', alignItems: 'center', gap: 16, padding: 22 },
+  btnIcon: { fontSize: 32 },
+  btnTitle: { color: '#fff', fontSize: 18, fontWeight: 'bold' },
+  btnDesc: { color: 'rgba(255,255,255,0.7)', fontSize: 12, marginTop: 2 },
+  btnTitleDark: { color: '#e2e8f0', fontSize: 18, fontWeight: 'bold' },
+  btnDescDark: { color: '#64748b', fontSize: 12, marginTop: 2 },
+  divider: { height: 1, backgroundColor: '#334155' },
+
+  // Top bar
+  topBar: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 16, paddingVertical: 12 },
+  backBtn: { paddingVertical: 6, paddingHorizontal: 4 },
+  backBtnText: { color: '#3b82f6', fontSize: 16 },
+  screenTitle: { color: '#fff', fontSize: 18, fontWeight: 'bold' },
+
+  // Video
   videoContainer: { flex: 1, backgroundColor: '#020617', margin: 16, borderRadius: 20, overflow: 'hidden', borderWidth: 1, borderColor: '#1e293b' },
   video: { flex: 1 },
-  placeholder: { flex: 1, justifyContent: 'center', alignItems: 'center', gap: 8 },
-  placeholderIcon: { fontSize: 48, marginBottom: 8 },
+  placeholder: { flex: 1, justifyContent: 'center', alignItems: 'center' },
+  placeholderIcon: { fontSize: 48, marginBottom: 12 },
   placeholderText: { color: '#475569', fontSize: 18, fontWeight: '600' },
-  placeholderSub: { color: '#334155', fontSize: 13 },
-  controls: { padding: 16, gap: 12 },
+  placeholderSub: { color: '#334155', fontSize: 13, marginTop: 6 },
+
+  // Controls
+  controls: { padding: 16, gap: 10 },
   codeBox: { backgroundColor: '#1e293b', padding: 16, borderRadius: 16, alignItems: 'center', borderWidth: 1, borderColor: '#334155' },
-  codeLabel: { color: '#64748b', fontSize: 12, letterSpacing: 2, textTransform: 'uppercase', marginBottom: 6 },
-  code: { fontSize: 36, fontWeight: 'bold', letterSpacing: 10, color: '#3b82f6', fontVariant: ['tabular-nums'] },
+  codeLabel: { color: '#64748b', fontSize: 11, letterSpacing: 2, textTransform: 'uppercase', marginBottom: 6 },
+  code: { fontSize: 38, fontWeight: 'bold', letterSpacing: 10, color: '#3b82f6' },
   codeHint: { color: '#475569', fontSize: 11, marginTop: 6 },
-  statusText: { color: '#94a3b8', fontSize: 13, textAlign: 'center', minHeight: 36 },
-  buttonStart: { backgroundColor: '#3b82f6', padding: 18, borderRadius: 14, alignItems: 'center' },
-  buttonStop: { backgroundColor: '#ef4444', padding: 18, borderRadius: 14, alignItems: 'center' },
-  buttonText: { color: '#fff', fontSize: 18, fontWeight: 'bold', letterSpacing: 0.5 },
+  statusText: { color: '#94a3b8', fontSize: 13, textAlign: 'center' },
+  inputLabel: { color: '#64748b', fontSize: 11, letterSpacing: 2, textTransform: 'uppercase', marginBottom: 4 },
+  codeInput: {
+    backgroundColor: '#1e293b', color: '#fff', fontSize: 28, fontWeight: 'bold',
+    letterSpacing: 8, textAlign: 'center', padding: 16, borderRadius: 14,
+    borderWidth: 1, borderColor: '#334155',
+  },
+  btnStart: { backgroundColor: '#3b82f6', padding: 18, borderRadius: 14, alignItems: 'center' },
+  btnStop: { backgroundColor: '#ef4444', padding: 18, borderRadius: 14, alignItems: 'center' },
+  btnDisabled: { backgroundColor: '#475569' },
+  actionBtnText: { color: '#fff', fontSize: 18, fontWeight: 'bold', letterSpacing: 0.5 },
 });

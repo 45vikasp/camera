@@ -57,14 +57,18 @@ export default function ViewerMode() {
 
     pc.ontrack = (event) => {
       console.log('Got remote track:', event.track.kind, event.streams);
+      let stream;
       if (event.streams && event.streams[0]) {
-        const stream = event.streams[0];
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          // Explicitly call play() - required on mobile browsers
-          videoRef.current.play().catch(e => console.warn('Video play error:', e));
-          setStatus('Live');
-        }
+        stream = event.streams[0];
+      } else {
+        stream = new MediaStream([event.track]);
+      }
+      
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        // Explicitly call play() - required on mobile browsers
+        videoRef.current.play().catch(e => console.warn('Video play error:', e));
+        setStatus('Live');
       }
     };
 

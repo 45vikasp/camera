@@ -22,6 +22,17 @@ import {
 const BACKEND_URL = 'https://camera-i73y.onrender.com';
 const ROOM_CODE_KEY = 'remocam_room_code';
 
+// Global error handler for Release mode crashes
+if (!__DEV__) {
+  const globalHandler = ErrorUtils.getGlobalHandler();
+  ErrorUtils.setGlobalHandler((error: any, isFatal?: boolean) => {
+    Alert.alert('JS Crash', `Error: ${error.message}\n\nPlease share this error.`);
+    if (globalHandler) {
+      globalHandler(error, isFatal);
+    }
+  });
+}
+
 // Lazy load native modules - prevents crash on startup
 let RTCPeerConnection: any = null;
 let RTCIceCandidate: any = null;
@@ -212,7 +223,7 @@ export default function App() {
       pc.onicecandidate = (e: any) => {
         if (e.candidate) socketRef.current?.emit('ice-candidate', { roomCode, candidate: e.candidate });
       };
-      streamRef.current?.getTracks().forEach((t: any) => pc.addTrack(t, streamRef.current));
+      streamRef.current?.getTracks().forEach((t: any) => pc.addTrack(t));
       const offer = await pc.createOffer({});
       await pc.setLocalDescription(offer);
       socketRef.current?.emit('offer', { roomCode, offer });

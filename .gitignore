@@ -1,0 +1,27 @@
+node_modules/
+.DS_Store
+.env
+dist/
+build/
+
+# Electron build outputs - don't commit binaries
+frontend/dist/
+frontend/dist-electron/
+frontend/node_modules/
+
+# Android build outputs
+RemoCamMobile/android/build/
+RemoCamMobile/android/app/build/
+RemoCamMobile/android/.gradle/
+RemoCamMobile/android/local.properties
+RemoCamMobile/android/app/src/main/assets/index.android.bundle
+RemoCamMobile/android/app/src/main/res/drawable-*
+RemoCamMobile/android/app/src/main/res/raw/
+RemoCamMobile/.bundle/
+RemoCamMobile/node_modules/
+*.apk
+*.aab
+
+# Logs
+*.log
+npm-debug.log*

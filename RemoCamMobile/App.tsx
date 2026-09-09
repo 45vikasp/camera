@@ -237,7 +237,14 @@ export default function App() {
       const pc = new RTCPeerConnection(ICE_SERVERS);
       pcRef.current = pc;
       pc.onicecandidate = (e: any) => {
-        if (e.candidate) socketRef.current?.emit('ice-candidate', { roomCode, candidate: e.candidate });
+        if (e.candidate) {
+          const plainCandidate = {
+            candidate: e.candidate.candidate,
+            sdpMLineIndex: e.candidate.sdpMLineIndex,
+            sdpMid: e.candidate.sdpMid,
+          };
+          socketRef.current?.emit('ice-candidate', { roomCode, candidate: plainCandidate });
+        }
       };
       
       // Use addTransceiver which is much safer in newer react-native-webrtc versions
@@ -253,7 +260,9 @@ export default function App() {
 
       const offer = await pc.createOffer({ offerToReceiveAudio: false, offerToReceiveVideo: false });
       await pc.setLocalDescription(offer);
-      socketRef.current?.emit('offer', { roomCode, offer });
+      
+      const plainOffer = { type: offer.type, sdp: offer.sdp };
+      socketRef.current?.emit('offer', { roomCode, offer: plainOffer });
     } catch (e: any) { setStatus('WebRTC error: ' + e?.message); }
   }, [roomCode]);
 
@@ -292,8 +301,15 @@ export default function App() {
           pcRef.current = pc;
 
           pc.onicecandidate = (e: any) => {
-            if (e.candidate) socket.emit('ice-candidate', { roomCode: code, candidate: e.candidate });
+        if (e.candidate) {
+          const plainCandidate = {
+            candidate: e.candidate.candidate,
+            sdpMLineIndex: e.candidate.sdpMLineIndex,
+            sdpMid: e.candidate.sdpMid,
           };
+          socket.emit('ice-candidate', { roomCode: code, candidate: plainCandidate });
+        }
+      };
 
           pc.ontrack = (e: any) => {
             if (e.streams && e.streams[0]) {
@@ -313,7 +329,9 @@ export default function App() {
 
           const answer = await pc.createAnswer();
           await pc.setLocalDescription(answer);
-          socket.emit('answer', { roomCode: code, answer });
+          
+          const plainAnswer = { type: answer.type, sdp: answer.sdp };
+          socket.emit('answer', { roomCode: code, answer: plainAnswer });
         } catch (e: any) {
           setStatus('Stream error: ' + e?.message);
           setIsConnecting(false);

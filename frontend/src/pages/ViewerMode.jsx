@@ -100,11 +100,15 @@ export default function ViewerMode() {
       }
     };
 
-    pc.onicecandidate = (event) => {
+      pc.onicecandidate = (event) => {
       if (event.candidate) {
         socket.emit('ice-candidate', {
           roomCode: roomCodeRef.current,
-          candidate: event.candidate,
+          candidate: {
+            candidate: event.candidate.candidate,
+            sdpMLineIndex: event.candidate.sdpMLineIndex,
+            sdpMid: event.candidate.sdpMid,
+          },
         });
       }
     };
@@ -122,7 +126,7 @@ export default function ViewerMode() {
       await pc.setLocalDescription(answer);
       socket.emit('answer', {
         roomCode: roomCodeRef.current,
-        answer: answer,
+        answer: { type: answer.type, sdp: answer.sdp },
       });
       console.log('Answer sent');
     } catch (err) {

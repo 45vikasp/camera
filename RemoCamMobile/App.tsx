@@ -71,7 +71,7 @@ function loadModules(): boolean {
 
 const ICE_SERVERS = {
   iceServers: [
-    { url: 'stun:stun.l.google.com:19302' }
+    { urls: ['stun:stun.l.google.com:19302'] }
   ],
 };
 
@@ -179,7 +179,7 @@ export default function App() {
           ReactNativeForegroundService.start({
             id: 3456, title: 'RemoCam Active',
             message: 'Camera is sharing in background',
-            icon: 'ic_launcher', setOnlyAlertOnce: true, color: '#3b82f6',
+            icon: 'ic_notification', setOnlyAlertOnce: true, color: '#3b82f6',
           });
         } catch (_) {}
       }
@@ -247,15 +247,9 @@ export default function App() {
         }
       };
       
-      // Use addTransceiver which is much safer in newer react-native-webrtc versions
+      // Use official addTrack with stream reference
       streamRef.current?.getTracks().forEach((t: any) => {
-        try {
-          pc.addTransceiver(t, { direction: 'sendonly' });
-        } catch (err) {
-          console.warn('addTransceiver error:', err);
-          // Fallback if addTransceiver fails
-          pc.addTrack(t, streamRef.current);
-        }
+        pc.addTrack(t, streamRef.current);
       });
 
       const offer = await pc.createOffer({ offerToReceiveAudio: false, offerToReceiveVideo: false });

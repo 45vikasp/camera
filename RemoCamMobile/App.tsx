@@ -61,10 +61,7 @@ function loadModules(): boolean {
     AsyncStorage = require('@react-native-async-storage/async-storage').default;
   } catch (e) { console.warn('AsyncStorage failed (non-fatal):', e); }
 
-  try {
-    ReactNativeForegroundService = require('@supersami/rn-foreground-service').default;
-    ReactNativeForegroundService.register();
-  } catch (e) { console.warn('ForegroundService failed (non-fatal):', e); ReactNativeForegroundService = null; }
+  // Foreground service removed to prevent Android 5-second OS kills
 
   return true;
 }
@@ -136,9 +133,7 @@ export default function App() {
       candidateQueue.current = [];
       setIsSharing(false);
       setIsConnecting(false);
-      if (ReactNativeForegroundService) {
-        try { ReactNativeForegroundService.stop(); } catch (_) {}
-      }
+      // ForegroundService removed
     } catch (e) { console.warn('cleanup error', e); }
   }, []);
 
@@ -173,16 +168,7 @@ export default function App() {
       streamRef.current = stream;
       setLocalStream(stream);
 
-      // Foreground service
-      if (ReactNativeForegroundService) {
-        try {
-          ReactNativeForegroundService.start({
-            id: 3456, title: 'RemoCam Active',
-            message: 'Camera is sharing in background',
-            icon: 'ic_notification', setOnlyAlertOnce: true, color: '#3b82f6',
-          });
-        } catch (_) {}
-      }
+      // ForegroundService removed to prevent 5-second crash
 
       setStatus('Connecting to server...');
       const socket = io(BACKEND_URL, { transports: ['websocket'], timeout: 10000 });
@@ -217,7 +203,7 @@ export default function App() {
       });
 
       socket.on('ice-candidate', (c: any) => {
-        if (c && pcRef.current) {
+        if (c && c.candidate && pcRef.current) {
           if (pcRef.current.remoteDescription) {
             pcRef.current.addIceCandidate(new RTCIceCandidate(c)).catch(console.error);
           } else {

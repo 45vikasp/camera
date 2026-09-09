@@ -71,11 +71,7 @@ function loadModules(): boolean {
 
 const ICE_SERVERS = {
   iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:openrelay.metered.ca:80' },
-    { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
-    { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+    { url: 'stun:stun.l.google.com:19302' }
   ],
 };
 
@@ -95,6 +91,7 @@ export default function App() {
   const socketRef = useRef<any>(null);
   const pcRef = useRef<any>(null);
   const streamRef = useRef<any>(null);
+  const candidateQueue = useRef<any[]>([]);
 
   // --- Init ---
   useEffect(() => {
@@ -136,6 +133,7 @@ export default function App() {
       socketRef.current = null;
       setLocalStream(null);
       setRemoteStream(null);
+      candidateQueue.current = [];
       setIsSharing(false);
       setIsConnecting(false);
       if (ReactNativeForegroundService) {
@@ -203,12 +201,30 @@ export default function App() {
         startShareWebRTC();
       });
 
-      socket.on('answer', (answer: any) => {
-        pcRef.current?.setRemoteDescription(new RTCSessionDescription(answer)).catch(console.error);
+      socket.on('answer', async (answer: any) => {
+        try {
+          if (pcRef.current) {
+            await pcRef.current.setRemoteDescription(new RTCSessionDescription(answer));
+            // Process any queued candidates
+            while (candidateQueue.current.length > 0) {
+              const c = candidateQueue.current.shift();
+              pcRef.current.addIceCandidate(new RTCIceCandidate(c)).catch(console.error);
+            }
+          }
+        } catch (err) {
+          console.warn('Set remote description error:', err);
+        }
       });
 
       socket.on('ice-candidate', (c: any) => {
-        if (c) pcRef.current?.addIceCandidate(new RTCIceCandidate(c)).catch(console.error);
+        if (c && pcRef.current) {
+          if (pcRef.current.remoteDescription) {
+            pcRef.current.addIceCandidate(new RTCIceCandidate(c)).catch(console.error);
+          } else {
+            // Queue candidate until remote description is set to avoid native crash
+            candidateQueue.current.push(c);
+          }
+        }
       });
     } catch (e: any) {
       setStatus('Error: ' + e?.message);
@@ -223,8 +239,19 @@ export default function App() {
       pc.onicecandidate = (e: any) => {
         if (e.candidate) socketRef.current?.emit('ice-candidate', { roomCode, candidate: e.candidate });
       };
-      streamRef.current?.getTracks().forEach((t: any) => pc.addTrack(t));
-      const offer = await pc.createOffer({});
+      
+      // Use addTransceiver which is much safer in newer react-native-webrtc versions
+      streamRef.current?.getTracks().forEach((t: any) => {
+        try {
+          pc.addTransceiver(t, { direction: 'sendonly' });
+        } catch (err) {
+          console.warn('addTransceiver error:', err);
+          // Fallback if addTransceiver fails
+          pc.addTrack(t, streamRef.current);
+        }
+      });
+
+      const offer = await pc.createOffer({ offerToReceiveAudio: false, offerToReceiveVideo: false });
       await pc.setLocalDescription(offer);
       socketRef.current?.emit('offer', { roomCode, offer });
     } catch (e: any) { setStatus('WebRTC error: ' + e?.message); }
@@ -277,6 +304,13 @@ export default function App() {
           };
 
           await pc.setRemoteDescription(new RTCSessionDescription(offer));
+          
+          // Process queued candidates
+          while (candidateQueue.current.length > 0) {
+            const c = candidateQueue.current.shift();
+            pc.addIceCandidate(new RTCIceCandidate(c)).catch(console.error);
+          }
+
           const answer = await pc.createAnswer();
           await pc.setLocalDescription(answer);
           socket.emit('answer', { roomCode: code, answer });
@@ -287,7 +321,13 @@ export default function App() {
       });
 
       socket.on('ice-candidate', (c: any) => {
-        if (c) pcRef.current?.addIceCandidate(new RTCIceCandidate(c)).catch(console.error);
+        if (c && pcRef.current) {
+          if (pcRef.current.remoteDescription) {
+            pcRef.current.addIceCandidate(new RTCIceCandidate(c)).catch(console.error);
+          } else {
+            candidateQueue.current.push(c);
+          }
+        }
       });
 
       socket.on('camera-offline', () => {

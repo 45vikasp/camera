@@ -37,6 +37,7 @@ export default function ViewerMode() {
   const videoRef = useRef(null);
   const peerConnectionRef = useRef(null);
   const roomCodeRef = useRef('');
+  const candidateQueue = useRef([]);
   const navigate = useNavigate();
 
   const cleanupPeer = () => {
@@ -110,6 +111,13 @@ export default function ViewerMode() {
 
     try {
       await pc.setRemoteDescription(new RTCSessionDescription(offer));
+      
+      // Process any queued candidates
+      while (candidateQueue.current.length > 0) {
+        const c = candidateQueue.current.shift();
+        pc.addIceCandidate(new RTCIceCandidate(c)).catch(e => console.warn('ICE add error:', e));
+      }
+
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
       socket.emit('answer', {
@@ -126,9 +134,13 @@ export default function ViewerMode() {
 
   const handleIceCandidate = useCallback((candidate) => {
     if (peerConnectionRef.current) {
-      peerConnectionRef.current
-        .addIceCandidate(new RTCIceCandidate(candidate))
-        .catch(e => console.warn('ICE candidate error (safe to ignore):', e));
+      if (peerConnectionRef.current.remoteDescription) {
+        peerConnectionRef.current
+          .addIceCandidate(new RTCIceCandidate(candidate))
+          .catch(e => console.warn('ICE candidate error (safe to ignore):', e));
+      } else {
+        candidateQueue.current.push(candidate);
+      }
     }
   }, []);
 

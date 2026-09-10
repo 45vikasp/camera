@@ -68,9 +68,55 @@ function loadModules(): boolean {
 
 const ICE_SERVERS = {
   iceServers: [
-    { urls: ['stun:stun.l.google.com:19302'] }
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    {
+      urls: 'turn:openrelay.metered.ca:80',
+      username: 'openrelayproject',
+      credential: 'openrelayproject',
+    },
+    {
+      urls: 'turn:openrelay.metered.ca:443',
+      username: 'openrelayproject',
+      credential: 'openrelayproject',
+    },
   ],
 };
+
+// Force VP8 codec in SDP to prevent H.264 hardware encoder crashes on Android
+// The previous implementation was broken (returned true for everything = no-op)
+function forceVP8InSDP(sdp: string): string {
+  try {
+    // Find VP8 payload type number (e.g., "96" from "a=rtpmap:96 VP8/90000")
+    const vp8Match = sdp.match(/a=rtpmap:(\d+) VP8\/90000/);
+    if (!vp8Match) {
+      console.warn('VP8 not found in SDP, using original');
+      return sdp; // VP8 not available, return as-is
+    }
+    const vp8PT = vp8Match[1];
+
+    // Find RTX payload type for VP8 (retransmission)
+    const rtxMatch = sdp.match(new RegExp(`a=fmtp:(\\d+) apt=${vp8PT}`));
+    const rtxPT = rtxMatch ? rtxMatch[1] : null;
+
+    // Build list of payload types to KEEP (VP8 + its RTX)
+    const keepPTs = rtxPT ? [vp8PT, rtxPT] : [vp8PT];
+    console.log('Keeping VP8 payload types:', keepPTs);
+
+    // Rewrite m=video line to only list VP8 payload types
+    // Before: "m=video 9 UDP/TLS/RTP/SAVPF 96 97 98 99 100 101"
+    // After:  "m=video 9 UDP/TLS/RTP/SAVPF 96 97"  (only VP8 + its RTX)
+    const newSdp = sdp.replace(
+      /m=video (\d+) ([A-Z/]+) ([\d ]+)/,
+      (_match: string, port: string, proto: string) =>
+        `m=video ${port} ${proto} ${keepPTs.join(' ')}`,
+    );
+    return newSdp;
+  } catch (e) {
+    console.warn('forceVP8InSDP failed, using original SDP:', e);
+    return sdp; // Fallback to original if manipulation fails
+  }
+}
 
 type Screen = 'home' | 'share' | 'view';
 
@@ -163,7 +209,12 @@ export default function App() {
     try {
       const stream = await mediaDevices.getUserMedia({
         audio: true,
-        video: { facingMode: 'environment', width: 640, height: 480 },
+        video: {
+          facingMode: 'environment',
+          width: { ideal: 640, max: 1280 },
+          height: { ideal: 480, max: 720 },
+          frameRate: { ideal: 24, max: 30 },
+        },
       });
       streamRef.current = stream;
       setLocalStream(stream);
@@ -184,7 +235,11 @@ export default function App() {
 
       socket.on('viewer-joined', () => {
         setStatus('📱 Viewer connected! Streaming...');
-        startShareWebRTC();
+        // Await properly and catch errors
+        startShareWebRTC().catch((e: any) => {
+          console.error('startShareWebRTC failed:', e);
+          setStatus('WebRTC init error: ' + e?.message);
+        });
       });
 
       socket.on('answer', async (answer: any) => {
@@ -194,7 +249,9 @@ export default function App() {
             // Process any queued candidates
             while (candidateQueue.current.length > 0) {
               const c = candidateQueue.current.shift();
-              pcRef.current.addIceCandidate(new RTCIceCandidate(c)).catch(console.error);
+              try {
+                await pcRef.current.addIceCandidate(new RTCIceCandidate(c));
+              } catch (e) { console.error('Ice queued error', e); }
             }
           }
         } catch (err) {
@@ -205,7 +262,7 @@ export default function App() {
       socket.on('ice-candidate', (c: any) => {
         if (c && c.candidate && pcRef.current) {
           if (pcRef.current.remoteDescription) {
-            pcRef.current.addIceCandidate(new RTCIceCandidate(c)).catch(console.error);
+            pcRef.current.addIceCandidate(new RTCIceCandidate(c)).catch((e:any) => console.error('Ice error', e));
           } else {
             // Queue candidate until remote description is set to avoid native crash
             candidateQueue.current.push(c);
@@ -220,8 +277,10 @@ export default function App() {
 
   const startShareWebRTC = useCallback(async () => {
     try {
+      console.log('startShareWebRTC: creating peer connection...');
       const pc = new RTCPeerConnection(ICE_SERVERS);
       pcRef.current = pc;
+
       pc.onicecandidate = (e: any) => {
         if (e.candidate) {
           const plainCandidate = {
@@ -232,18 +291,43 @@ export default function App() {
           socketRef.current?.emit('ice-candidate', { roomCode, candidate: plainCandidate });
         }
       };
-      
-      // Use official addTrack with stream reference
-      streamRef.current?.getTracks().forEach((t: any) => {
+
+      pc.onconnectionstatechange = () => {
+        console.log('PC connection state:', pc.connectionState);
+      };
+
+      // Add tracks from local stream
+      if (!streamRef.current) {
+        throw new Error('No local stream available');
+      }
+      streamRef.current.getTracks().forEach((t: any) => {
+        console.log('Adding track:', t.kind);
         pc.addTrack(t, streamRef.current);
       });
 
-      const offer = await pc.createOffer({ offerToReceiveAudio: false, offerToReceiveVideo: false });
-      await pc.setLocalDescription(offer);
-      
-      const plainOffer = { type: offer.type, sdp: offer.sdp };
+      // Create offer
+      console.log('Creating offer...');
+      const offer = await pc.createOffer({
+        offerToReceiveAudio: false,
+        offerToReceiveVideo: false,
+      });
+
+      // ✅ PROPERLY force VP8 to prevent H.264 hardware encoder crash on Android
+      // Previous implementation was broken (returned true for all - was a complete no-op)
+      const vp8SDP = forceVP8InSDP(offer.sdp);
+      console.log('SDP VP8 forced, setting local description...');
+
+      // Set local description with VP8-only SDP
+      await pc.setLocalDescription({ type: offer.type, sdp: vp8SDP });
+
+      // Send the VP8-only offer to viewer
+      const plainOffer = { type: offer.type, sdp: vp8SDP };
       socketRef.current?.emit('offer', { roomCode, offer: plainOffer });
-    } catch (e: any) { setStatus('WebRTC error: ' + e?.message); }
+      console.log('Offer sent to viewer');
+    } catch (e: any) {
+      console.error('startShareWebRTC error:', e);
+      setStatus('WebRTC error: ' + (e?.message || 'Unknown error'));
+    }
   }, [roomCode]);
 
   const stopSharing = useCallback(() => {
